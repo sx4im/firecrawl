@@ -321,8 +321,12 @@ describe("Scrape tests", () => {
   concurrentIf(
     TEST_SELF_HOST && HAS_PLAYWRIGHT && !playwrightAllowsLocalTargets,
   )(
-    "playwright blocks local-network targets resolved via DNS",
+    "playwright fails local-network targets resolved via DNS",
     async () => {
+      // A blocked private target must fail the scrape like the fetch
+      // engine's InsecureConnectionError path does: success:false with the
+      // all-engines-failed error, never a success:true document carrying
+      // the refusal in metadata.
       const raw = await scrapeRaw(
         {
           url: createDnsResolvedLocalUrl(),
@@ -331,12 +335,11 @@ describe("Scrape tests", () => {
         identity,
       );
 
-      expect(raw.statusCode).toBe(200);
-      expect(raw.body.success).toBe(true);
-      expect(raw.body.data?.metadata?.statusCode).toBe(403);
-      expect(raw.body.data?.metadata?.error).toContain(
-        "Blocked insecure target URL",
-      );
+      expect(raw.statusCode).toBe(500);
+      expect(raw.body.success).toBe(false);
+      expect(raw.body.code).toBe("SCRAPE_ALL_ENGINES_FAILED");
+      expect(raw.body.error).toContain("All scraping engines failed");
+      expect(raw.body.data).toBeUndefined();
     },
     scrapeTimeout,
   );

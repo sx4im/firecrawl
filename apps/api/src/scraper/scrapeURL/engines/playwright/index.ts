@@ -3,6 +3,7 @@ import { config } from "../../../../config";
 import { EngineScrapeResult } from "..";
 import { Meta } from "../..";
 import { robustFetch } from "../../lib/fetch";
+import { InsecureConnectionError } from "../utils/safeFetch";
 import { getInnerJson } from "@mendable/firecrawl-rs";
 
 export async function scrapeURLWithPlaywright(
@@ -33,6 +34,20 @@ export async function scrapeURLWithPlaywright(
     mock: meta.mock,
     abort: meta.abort.asSignal(),
   });
+
+  // The playwright service answers a blocked private target with HTTP 200
+  // and a 403 pageError instead of failing the request. Without this, the
+  // empty 403 result is deemed a successful scrape upstream (a non-2xx
+  // status counts as "has output"), so a blocked target comes back as
+  // success:true. Fail the same way the fetch engine does: it throws
+  // InsecureConnectionError for private targets, and the waterfall then
+  // ends in NoEnginesLeftError (success:false) once every engine refuses.
+  // The "Blocked insecure target URL" prefix is only ever produced by the
+  // service's InsecureConnectionError (pre-flight check and blocked
+  // navigation alike).
+  if (response.pageError?.startsWith("Blocked insecure target URL")) {
+    throw new InsecureConnectionError();
+  }
 
   if (response.contentType?.includes("application/json")) {
     response.content = await getInnerJson(response.content);

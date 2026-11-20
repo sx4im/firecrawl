@@ -380,11 +380,11 @@ app.post('/scrape', async (req: Request, res: Response) => {
     await assertSafeTargetUrl(url);
   } catch (error) {
     if (error instanceof InsecureConnectionError) {
-      return res.json({
-        content: '',
-        pageStatusCode: 403,
-        pageError: error.message,
-      });
+      // A refused target is an error, not a scrape result. Answering it
+      // with HTTP 200 and a 403 pageError let the API return the refusal
+      // as a successful scrape (success:true), so clients checking success
+      // saw a scrape with no content.
+      return res.status(403).json({ error: error.message });
     }
     throw error;
   }
@@ -522,11 +522,9 @@ app.post('/scrape', async (req: Request, res: Response) => {
     });
   } catch (error) {
     if (error instanceof InsecureConnectionError) {
-      return res.json({
-        content: '',
-        pageStatusCode: 403,
-        pageError: error.message,
-      });
+      // Same as the pre-flight refusal above: a blocked navigation is an
+      // error, not a 200 scrape result.
+      return res.status(403).json({ error: error.message });
     }
     console.error('Scrape error:', error);
     res
