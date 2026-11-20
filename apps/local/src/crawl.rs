@@ -332,6 +332,10 @@ where
 
   let mut frontier: VecDeque<(Url, u32)> = VecDeque::new();
   let mut visited: HashSet<String> = HashSet::new();
+  // Canonical final URLs already returned. A fetch can land somewhere
+  // other than the queued URL when the server redirects, so the queued
+  // key alone cannot dedup pages.
+  let mut saved: HashSet<String> = HashSet::new();
   let mut robots_blocked = Vec::new();
 
   let enqueue = |url: Url,
@@ -400,6 +404,23 @@ where
     };
     match res {
       Ok((doc, links)) => {
+        // The fetch may have followed a redirect, so the page lives at
+        // its final URL, not the queued one. Claim the final URL: a link
+        // back to it (e.g. a page linking to itself) must not fetch the
+        // same page again, and a second in-flight fetch that landed on
+        // the same final URL is a duplicate, not a new page.
+        let final_key = doc
+          .pointer("/metadata/url")
+          .and_then(Value::as_str)
+          .and_then(|s| Url::parse(s).ok())
+          .map(|u| canonical(&u))
+          .unwrap_or_else(|| canonical(&url));
+        visited.insert(final_key.clone());
+        if !saved.insert(final_key) {
+          // Already saved under this final URL: not a new page.
+          started -= 1;
+          continue;
+        }
         on_page(&doc);
         pages.push(doc);
         if depth < max_depth && opts.sitemap != "only" {
@@ -667,5 +688,75 @@ mod tests {
   fn canonical_drops_fragment_and_trailing_slash() {
     assert_eq!(canonical(&u("https://a.dev/x/#top")), "https://a.dev/x");
     assert_eq!(canonical(&u("https://a.dev/")), "https://a.dev/");
+  }
+
+  /// The seed redirects to a page that links to itself: the page is one
+  /// page, not two. Regression test for #5925.
+  #[tokio::test]
+  async fn redirect_to_self_linking_page_is_saved_once() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+      .await
+      .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+      while let Ok((mut socket, _)) = listener.accept().await {
+        tokio::spawn(async move {
+          let mut buf = vec![0u8; 8192];
+          let n = socket.read(&mut buf).await.unwrap_or(0);
+          let path = String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("/")
+            .to_string();
+          let answer = if path == "/" {
+            "HTTP/1.1 308 Permanent Redirect\r\nlocation: /introduction\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+          } else if path == "/introduction" {
+            let body = "<html><head><title>Introduction</title></head><body><h1>Introduction</h1><p>Welcome to the docs.</p><a href=\"/introduction\">Introduction</a></body></html>";
+            format!(
+              "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+              body.len(),
+              body
+            )
+          } else {
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+          };
+          let _ = socket.write_all(answer.as_bytes()).await;
+        });
+      }
+    });
+    let engine = Arc::new(
+      Engine::new(crate::scrape::EngineConfig {
+        policy: crate::guard::NetworkPolicy::AllowPrivate,
+        user_agent: None,
+        browser: crate::scrape::BrowserMode::Never,
+      })
+      .unwrap(),
+    );
+    let opts = CrawlOptions {
+      limit: 20,
+      include_paths: vec!["^/introduction".into()],
+      sitemap: "skip".into(),
+      ..Default::default()
+    };
+    let outcome = crawl(engine, &format!("{base}/"), &opts, |_| {})
+      .await
+      .unwrap();
+    assert_eq!(outcome.errors.len(), 0, "{:?}", outcome.errors);
+    assert_eq!(
+      outcome.pages.len(),
+      1,
+      "{}",
+      serde_json::to_string_pretty(&outcome.pages).unwrap()
+    );
+    assert_eq!(
+      outcome.pages[0]
+        .pointer("/metadata/url")
+        .and_then(Value::as_str),
+      Some(format!("{base}/introduction").as_str())
+    );
   }
 }
