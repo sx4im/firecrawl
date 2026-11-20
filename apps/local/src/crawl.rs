@@ -332,6 +332,10 @@ where
 
   let mut frontier: VecDeque<(Url, u32)> = VecDeque::new();
   let mut visited: HashSet<String> = HashSet::new();
+  // Final URLs already saved, keyed like `visited`. A fetch can land on a
+  // URL that was queued under another key: the seed redirecting to a page
+  // that links to itself, or a sitemap listing the redirect target.
+  let mut saved: HashSet<String> = HashSet::new();
   let mut robots_blocked = Vec::new();
 
   let enqueue = |url: Url,
@@ -400,6 +404,23 @@ where
     };
     match res {
       Ok((doc, links)) => {
+        // The fetcher follows redirects, so the saved URL is the final one.
+        // Remember it: the same page reached under another key (the seed
+        // that redirected here, a sitemap entry, a self-link) must not be
+        // fetched or saved a second time.
+        let final_key = doc
+          .pointer("/metadata/url")
+          .and_then(Value::as_str)
+          .and_then(|s| Url::parse(s).ok())
+          .map(|u| canonical(&u))
+          .unwrap_or_else(|| canonical(&url));
+        if !saved.insert(final_key.clone()) {
+          // Already saved under this final URL; a duplicate does not count
+          // against the limit.
+          started -= 1;
+          continue;
+        }
+        visited.insert(final_key);
         on_page(&doc);
         pages.push(doc);
         if depth < max_depth && opts.sitemap != "only" {
@@ -667,5 +688,120 @@ mod tests {
   fn canonical_drops_fragment_and_trailing_slash() {
     assert_eq!(canonical(&u("https://a.dev/x/#top")), "https://a.dev/x");
     assert_eq!(canonical(&u("https://a.dev/")), "https://a.dev/");
+  }
+
+  /// A tiny site for the redirect tests: `/` answers 308 to
+  /// `/introduction`, which links to itself.
+  async fn redirect_site() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+      .await
+      .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let host = base.clone();
+    tokio::spawn(async move {
+      while let Ok((mut socket, _)) = listener.accept().await {
+        let host = host.clone();
+        tokio::spawn(async move {
+          let mut buf = vec![0u8; 8192];
+          let mut head = Vec::new();
+          loop {
+            match socket.read(&mut buf).await {
+              Ok(0) | Err(_) => return,
+              Ok(n) => {
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                  break;
+                }
+              }
+            }
+          }
+          let text = String::from_utf8_lossy(&head);
+          let path = text.split_whitespace().nth(1).unwrap_or("/");
+          let (status, ctype, body): (&str, &str, String) = match path {
+            "/" => ("308 Permanent Redirect", "text/html", String::new()),
+            "/introduction" => (
+              "200 OK",
+              "text/html",
+              "<html><body><a href=\"/introduction\">Intro</a><p>Hello</p></body></html>"
+                .into(),
+            ),
+            "/sitemap.xml" => (
+              "200 OK",
+              "application/xml",
+              format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>{host}/introduction</loc></url></urlset>"
+              ),
+            ),
+            _ => ("404 Not Found", "text/html", String::new()),
+          };
+          let mut answer = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n",
+            body.len()
+          );
+          if path == "/" {
+            answer.push_str("location: /introduction\r\n");
+          }
+          answer.push_str("\r\n");
+          answer.push_str(&body);
+          let _ = socket.write_all(answer.as_bytes()).await;
+        });
+      }
+    });
+    base
+  }
+
+  fn test_engine() -> Arc<Engine> {
+    Arc::new(
+      Engine::new(crate::scrape::EngineConfig {
+        policy: crate::guard::NetworkPolicy::AllowPrivate,
+        user_agent: None,
+        browser: crate::scrape::BrowserMode::Never,
+      })
+      .unwrap(),
+    )
+  }
+
+  #[tokio::test]
+  async fn redirect_to_self_linking_page_is_saved_once() {
+    let base = redirect_site().await;
+    let opts = CrawlOptions {
+      limit: 20,
+      include_paths: vec!["^/introduction".into()],
+      ignore_robots_txt: true,
+      sitemap: "skip".into(),
+      ..Default::default()
+    };
+    let mut seen = 0;
+    let outcome = crawl(test_engine(), &base, &opts, |_| seen += 1)
+      .await
+      .unwrap();
+    assert_eq!(outcome.errors.len(), 0, "{:?}", outcome.errors);
+    assert_eq!(outcome.pages.len(), 1);
+    assert_eq!(seen, 1);
+    let url = outcome.pages[0]
+      .pointer("/metadata/url")
+      .and_then(Value::as_str)
+      .unwrap();
+    assert_eq!(url, format!("{base}/introduction"));
+  }
+
+  #[tokio::test]
+  async fn redirect_target_listed_in_sitemap_is_saved_once() {
+    let base = redirect_site().await;
+    let engine = test_engine();
+    // Pin the setup: the sitemap really does list the redirect target,
+    // so the seed fetch and the direct fetch race on the same final URL.
+    let listed = sitemap_urls(&engine, &u(&base), &[], 10).await;
+    assert_eq!(listed, vec![format!("{base}/introduction")]);
+    let opts = CrawlOptions {
+      limit: 20,
+      include_paths: vec!["^/introduction".into()],
+      ignore_robots_txt: true,
+      ..Default::default()
+    };
+    let outcome = crawl(engine, &base, &opts, |_| {}).await.unwrap();
+    assert_eq!(outcome.errors.len(), 0, "{:?}", outcome.errors);
+    assert_eq!(outcome.pages.len(), 1);
   }
 }
