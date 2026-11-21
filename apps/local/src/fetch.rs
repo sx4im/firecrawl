@@ -27,6 +27,14 @@ pub const USER_AGENT: &str = concat!(
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 10;
 
+/// The default `Accept` header.
+const DEFAULT_ACCEPT: &str =
+  "text/html,application/xhtml+xml,application/xml;q=0.9,text/markdown;q=0.9,*/*;q=0.8";
+
+/// The default `Accept` header without the `text/markdown` entry.
+const ACCEPT_WITHOUT_MARKDOWN: &str =
+  "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+
 #[derive(Debug)]
 pub enum FetchError {
   Blocked(String),
@@ -164,12 +172,7 @@ pub struct FetchOptions {
 impl Fetcher {
   pub fn new(policy: NetworkPolicy, user_agent: Option<&str>) -> Result<Self, String> {
     let mut default_headers = HeaderMap::new();
-    default_headers.insert(
-      ACCEPT,
-      HeaderValue::from_static(
-        "text/html,application/xhtml+xml,application/xml;q=0.9,text/markdown;q=0.9,*/*;q=0.8",
-      ),
-    );
+    default_headers.insert(ACCEPT, HeaderValue::from_static(DEFAULT_ACCEPT));
     default_headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
 
     let redirect_policy = redirect::Policy::custom(move |attempt| {
@@ -204,11 +207,26 @@ impl Fetcher {
   /// Fetch a URL, retrying once when the connection itself failed (a reset,
   /// a DNS hiccup, a dropped handshake). Those are usually gone a moment
   /// later; a refused certificate, a timeout or a guard refusal is not.
+  ///
+  /// A 4xx answer is also retried once without `text/markdown` in `Accept`
+  /// when the request advertised it: some hosts route any request that
+  /// mentions `text/markdown` to their markdown variant, ignoring q-values,
+  /// and answer 404 for pages that exist as HTML (react.dev does this).
   pub async fn fetch(&self, url: &Url, opts: &FetchOptions) -> Result<FetchResult, FetchError> {
     match self.fetch_once(url, opts).await {
       Err(FetchError::Network(msg)) if is_transient(&msg) => {
         tokio::time::sleep(Duration::from_millis(250)).await;
         self.fetch_once(url, opts).await
+      }
+      Ok(result) if (400..500).contains(&result.status) && advertised_markdown(opts) => {
+        let mut retry_opts = opts.clone();
+        retry_opts
+          .headers
+          .retain(|k, _| !k.eq_ignore_ascii_case("accept"));
+        retry_opts
+          .headers
+          .insert(ACCEPT.to_string(), ACCEPT_WITHOUT_MARKDOWN.to_string());
+        self.fetch_once(url, &retry_opts).await
       }
       other => other,
     }
@@ -261,6 +279,18 @@ impl Fetcher {
       headers,
     })
   }
+}
+
+/// Whether the request advertises `text/markdown`: the caller's `Accept`
+/// override when it sets one, else the default header.
+fn advertised_markdown(opts: &FetchOptions) -> bool {
+  opts
+    .headers
+    .iter()
+    .find(|(k, _)| k.eq_ignore_ascii_case("accept"))
+    .map(|(_, v)| v.as_str())
+    .unwrap_or(DEFAULT_ACCEPT)
+    .contains("text/markdown")
 }
 
 /// A network failure worth one more try: anything but a certificate the
@@ -323,5 +353,105 @@ mod tests {
   #[test]
   fn utf8_default() {
     assert_eq!(decode_body("héllo".as_bytes(), None), "héllo");
+  }
+
+  use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+  };
+
+  /// How the test server answers.
+  #[derive(Clone, Copy, PartialEq, Eq)]
+  enum ServerMode {
+    /// 404 when the request advertises text/markdown, 200 otherwise (react.dev).
+    Markdown404,
+    /// 404 whatever the request says.
+    Always404,
+    /// 200 whatever the request says.
+    Always200,
+  }
+
+  /// A loopback server that counts requests; returns its base URL and the counter.
+  async fn start_server(mode: ServerMode) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&hits);
+    let app = axum::Router::new().route(
+      "/",
+      axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let advertises_markdown = headers
+          .get(axum::http::header::ACCEPT)
+          .and_then(|v| v.to_str().ok())
+          .is_some_and(|v| v.contains("text/markdown"));
+        let status = match mode {
+          ServerMode::Always200 => axum::http::StatusCode::OK,
+          ServerMode::Always404 => axum::http::StatusCode::NOT_FOUND,
+          ServerMode::Markdown404 => {
+            if advertises_markdown {
+              axum::http::StatusCode::NOT_FOUND
+            } else {
+              axum::http::StatusCode::OK
+            }
+          }
+        };
+        let body = if status.is_success() {
+          "hello page"
+        } else {
+          "Not Found"
+        };
+        (status, body)
+      }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+      axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/"), hits)
+  }
+
+  async fn fetch(url: &str, opts: &FetchOptions) -> FetchResult {
+    let fetcher = Fetcher::new(NetworkPolicy::AllowPrivate, None).unwrap();
+    fetcher
+      .fetch(&Url::parse(url).unwrap(), opts)
+      .await
+      .unwrap()
+  }
+
+  #[tokio::test]
+  async fn client_error_is_retried_without_markdown() {
+    let (base, hits) = start_server(ServerMode::Markdown404).await;
+    let res = fetch(&base, &FetchOptions::default()).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.text(), "hello page");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+  }
+
+  #[tokio::test]
+  async fn client_error_without_markdown_still_reports_the_error() {
+    let (base, hits) = start_server(ServerMode::Always404).await;
+    let res = fetch(&base, &FetchOptions::default()).await;
+    assert_eq!(res.status, 404);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+  }
+
+  #[tokio::test]
+  async fn success_is_not_retried() {
+    let (base, hits) = start_server(ServerMode::Always200).await;
+    let res = fetch(&base, &FetchOptions::default()).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+  }
+
+  #[tokio::test]
+  async fn custom_accept_without_markdown_is_not_retried() {
+    let (base, hits) = start_server(ServerMode::Always404).await;
+    let mut opts = FetchOptions::default();
+    opts
+      .headers
+      .insert("accept".to_string(), "text/html,*/*;q=0.8".to_string());
+    let res = fetch(&base, &opts).await;
+    assert_eq!(res.status, 404);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
   }
 }
